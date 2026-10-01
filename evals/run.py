@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import math
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -43,7 +44,10 @@ def chat_ids(tok, text: str) -> list[int]:
 def run_llamacpp(model: dict, cfg: dict, prompts: list[dict], repeats: int) -> list[dict]:
     port = 18181
     url = f"http://127.0.0.1:{port}"
-    proc = subprocess.Popen(["llama-server", "-m", str(Path(model["gguf"]).expanduser()), "--port", str(port),
+    import glob
+
+    gguf = sorted(glob.glob(str(Path(model["gguf"]).expanduser())))[-1]
+    proc = subprocess.Popen(["llama-server", "-m", gguf, "--port", str(port),
                              "-fa", "on", "-c", "8192", "--jinja", "-ngl", "99", "--no-warmup"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -146,6 +150,7 @@ def run_dflash(model: dict, cfg: dict, prompts: list[dict], repeats: int) -> lis
                                  draft_quant=cfg.get("draft_quant"), verify_config=ctx.verify)
     tok = bundle.tokenizer
     stop = get_stop_token_ids(tok)
+    cfg["_load_meta"] = {k: v for k, v in getattr(bundle, "meta", {}).items() if isinstance(v, (bool, int, str, float))}
     if cfg.get("skinny"):
         from skinny_mlx.patch import patch_model
 
@@ -247,6 +252,7 @@ def main() -> None:
     if args.summary:
         return summarize(args.model)
     model, cfg = MODELS[args.model], CONFIGS[args.config]
+    os.environ.update(cfg.get("env", {}))  # engine knobs read at import/load time
     t0 = time.time()
     records = ENGINES[cfg["engine"]](model, cfg, PROMPTS, args.repeats)
     for p, r in zip(PROMPTS, records):
