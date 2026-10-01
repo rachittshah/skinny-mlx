@@ -80,7 +80,7 @@ _SOURCE = """
         if (tt < M) {
             float v = 0.0f;
             for (uint s = 0; s < SK; s++) v += red[s][rr][tt];
-            out[tt * N + row0 + rr] = v;
+            out[tt * N + row0 + rr] = static_cast<OutT>(v);
         }
     }
 """
@@ -130,7 +130,10 @@ CONFIG_OVERRIDE: tuple[int, int] | None = None
 
 
 def skinny_qmm(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array) -> mx.array:
-    """x [M,K] fp16 @ dequant(w)[N,K]^T -> [M,N]. w must be repack_for_skinny()-ed MLX 4-bit, group 64."""
+    """x [M,K] @ dequant(w)[N,K]^T -> [M,N] in x's dtype. w must be repack_for_skinny()-ed MLX 4-bit,
+    group 64. MMA runs in fp16 (bf16/fp32 inputs are cast; the cast is part of the measured cost)."""
+    out_dtype = x.dtype
+    x = x.astype(mx.float16)
     m, k = x.shape
     n = w.shape[0]
     rf, sk = config_for(m, k)
@@ -141,11 +144,11 @@ def skinny_qmm(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array) -> 
     assert (k // 64) % sk == 0 and n % (8 * rf) == 0, (m, k, n)
     return _kernel(
         inputs=[x, xsum, w, scales, biases],
-        template=[("M", m), ("TF", tf), ("RF", rf), ("SK", sk), ("K", k), ("N", n)],
+        template=[("OutT", out_dtype), ("M", m), ("TF", tf), ("RF", rf), ("SK", sk), ("K", k), ("N", n)],
         grid=(32 * sk, n // (8 * rf), 1),
         threadgroup=(32 * sk, 1, 1),
         output_shapes=[(m, n)],
-        output_dtypes=[x.dtype],
+        output_dtypes=[out_dtype],
     )[0]
 
 

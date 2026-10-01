@@ -20,8 +20,7 @@ def _qmm(x: mx.array, w, s, b, rw, group_size: int, bits: int) -> mx.array:
     k = x.shape[-1]
     m = x.size // k
     if SKINNY_RANGE[0] <= m <= SKINNY_RANGE[1]:
-        y = skinny_qmm(x.reshape(m, k).astype(mx.float16), rw, s, b)
-        return y.astype(x.dtype).reshape(*x.shape[:-1], -1)
+        return skinny_qmm(x.reshape(m, k), rw, s, b).reshape(*x.shape[:-1], -1)
     return mx.quantized_matmul(x, w, s, b, transpose=True, group_size=group_size, bits=bits)
 
 
