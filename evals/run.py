@@ -2,6 +2,7 @@
 
 Metric (programmatic grader, per blog guidance "cheapest grader that works"):
   ratio = candidate decode tok/s / llama.cpp decode tok/s on the same model (Q4_K_M vs MLX 4-bit),
+  measured only in idle-GPU windows; a pair is discarded if llama.cpp ran below 85% of its clean speed,
   per prompt, geometric mean per split. Target: >= 4.0 on train AND test.
 Paired design: llama-server stays up for the session; per prompt we alternate
   llama.cpp, candidate, llama.cpp, candidate, ... and score each candidate run against the mean of
@@ -34,6 +35,22 @@ from evals.configs import CONFIGS, MODELS
 from evals.eval_set import PROMPTS
 
 RESULTS = Path(__file__).resolve().parent / "results"
+CLEAN_BASE_MIN = 0.85  # a pair is valid only if llama.cpp ran at >= 85% of its clean (idle-GPU) speed
+MAX_RETRIES = 20
+
+
+def gpu_util() -> int:
+    out = subprocess.run(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"], capture_output=True, text=True).stdout
+    i = out.find('"Device Utilization %"=')
+    return int(out[i + 23 :].split(",")[0].split("}")[0]) if i >= 0 else 0
+
+
+def wait_quiet(max_util: int = 5, samples: int = 3, timeout_s: float = 3600) -> None:
+    """Block until the GPU is idle (no foreign jobs) for `samples` consecutive 0.5 s readings."""
+    t0, ok = time.time(), 0
+    while ok < samples and time.time() - t0 < timeout_s:
+        ok = ok + 1 if gpu_util() <= max_util else 0
+        time.sleep(0.5)
 MAX_TOKENS = 256
 TIE_GAP = 0.5  # logits; 0.125-0.25 is 1-2 bf16 ulps at typical top-logit magnitudes
 
@@ -165,20 +182,27 @@ def run_paired(model: dict, cfg: dict, rounds: int) -> list[dict]:
         out = []
         for p in PROMPTS:
             gen(p, 16)  # warm this prompt's shapes
-            gpu_warm(0.3)
-            base = [server.generate(p)]
-            cands, ratios = [], []
-            for _ in range(rounds):
+            cands, ratios, base, rejected = [], [], [], 0
+            while len(ratios) < rounds and rejected < MAX_RETRIES:
+                wait_quiet()  # other GPU jobs on the machine: measure only in idle windows
+                gpu_warm(0.3)
+                b0 = server.generate(p)
                 c = gen(p)
-                b = server.generate(p)
-                base.append(b)
+                b1 = server.generate(p)
+                if min(b0["tps"], b1["tps"]) < CLEAN_BASE_MIN * model["clean_base_tps"]:
+                    rejected += 1  # contended pair: discard, don't average it in
+                    continue
+                base += [b0, b1]
                 cands.append(c)
-                ratios.append(c["tps"] / ((base[-2]["tps"] + base[-1]["tps"]) / 2))
+                ratios.append(c["tps"] / ((b0["tps"] + b1["tps"]) / 2))
+            if not ratios:
+                raise RuntimeError(f"{p['id']}: no clean pair in {MAX_RETRIES} tries (GPU never idle)")
             rec = dict(cands[max(range(rounds), key=lambda i: cands[i]["tps"])])
             rec.update(ratio=statistics.median(ratios), ratios=[round(r, 3) for r in ratios],
-                       base_tps=statistics.median(b["tps"] for b in base))
+                       base_tps=statistics.median(b["tps"] for b in base), rejected_pairs=rejected)
             out.append(rec)
-            print(f"  {p['id']:14s} {rec['tps']:6.1f} tok/s  vs llama.cpp {rec['base_tps']:5.1f}  ratio {rec['ratio']:.2f}",
+            print(f"  {p['id']:14s} {rec['tps']:6.1f} tok/s  vs llama.cpp {rec['base_tps']:5.1f}  ratio {rec['ratio']:.2f}"
+                  f"  (rejected {rejected} contended pairs)",
                   flush=True)
         return out
     finally:

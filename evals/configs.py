@@ -2,10 +2,11 @@
 
 MODELS = {
     "4b": dict(mlx="mlx-community/Qwen3.5-4B-MLX-4bit", hf="Qwen/Qwen3.5-4B",
-               gguf="~/inference-lab/models/Qwen3.5-4B-Q4_K_M.gguf", dflash_draft="z-lab/Qwen3.5-4B-DFlash"),
+               gguf="~/inference-lab/models/Qwen3.5-4B-Q4_K_M.gguf", dflash_draft="z-lab/Qwen3.5-4B-DFlash",
+               clean_base_tps=70.0),  # llama.cpp decode on an idle GPU (llama-bench tg128 74.6; server ~70)
     "9b": dict(mlx="mlx-community/Qwen3.5-9B-MLX-4bit", hf="Qwen/Qwen3.5-9B",
                gguf="~/.cache/huggingface/hub/models--unsloth--Qwen3.5-9B-GGUF/snapshots/*/Qwen3.5-9B-Q4_K_M.gguf",
-               dflash_draft="z-lab/Qwen3.5-9B-DFlash"),
+               dflash_draft="z-lab/Qwen3.5-9B-DFlash", clean_base_tps=None),  # set from an idle-GPU llama-bench
 }
 
 CONFIGS = {
