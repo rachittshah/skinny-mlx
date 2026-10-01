@@ -1,0 +1,15 @@
+[project]
+name = "skinny-mlx"
+version = "0.1.0"
+description = "Flat-cost 2-16 token quantized matmul for MLX on Apple Silicon: makes speculative verification ~free"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = ["mlx>=0.32", "mlx-lm>=0.31", "numpy"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["skinny_mlx"]
