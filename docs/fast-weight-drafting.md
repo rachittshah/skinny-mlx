@@ -70,8 +70,15 @@ The short-context gain over a 4-bit DFlash is modest (draft cost is already smal
 RMS-normalizes k) and β∈(0,1), Sherman–Morrison gives `(I − βkkᵀ)⁻¹ = I + (β/(1−β))kkᵀ`, so
 `S_{t−1} = (S_t − β v kᵀ)(I + (β/(1−β)) kkᵀ) / g_t`. Rejected draft rows can be *un-applied* from the
 post-verify state in O(rejected) time with O(1) extra memory — no per-token snapshots (#1730) and no
-replay of accepted rows (tape-replay). Per cycle choose min(replay accepted, unroll rejected). Guard:
-fall back to replay when `g(1−β)` is small (division amplifies rounding).
+replay of accepted rows (tape-replay). Per cycle choose min(replay accepted, unroll rejected).
+
+*Measured (CPU only, `bench/reversal_check.py`, real activations of the first 6 GDN layers of
+Qwen3.5-4B, fp32):* relative state error after un-applying R rejected tokens — R=1: median 9.7e-5
+(max 4.4e-3); R=4: median 3.7e-4 (max 1.3e-3); **R=8: median 2.1e-2, max 5.9; R=15: diverges (1e10)**.
+A per-step guard `g(1−β) < 1e-3` never fired (0.000% of steps), yet error exploded: amplification is
+*cumulative* (∏ 1/(g(1−β)) along successive key directions). Verdict: **partially killed** — usable
+only as "unroll if ≤ 4 rejected, else replay", where the guard must bound the running product.
+Small payoff either way; not part of the 4× path.
 
 **2. Knee-budgeted verify shapes.** Treat the verify pass as a fixed-cost bus of R rows, where R is
 the *measured* knee of this device's cost curve (≈8 on M4 with skinny-mlx, larger on M5 TensorOps),
@@ -101,6 +108,6 @@ nor of Sherman–Morrison reversal of the delta rule for speculative rollback, i
    `h_t` alone, the memory isn't carrying usable draft signal → stop.
 2. **Drafter:** train a 2-layer FWD (distillation on target greedy outputs). Kill if α@1k < 0.80, or
    α@8k − α@1k < (DFlash's α@8k − α@1k), i.e. no long-context advantage.
-3. **Reversal stability:** on recorded (g, β) traces, measure fraction of tokens with `g(1−β) < 1e-3`
-   and reconstruction error of `S_{t−1}`. Kill reversal if fallback is needed on > 20% of cycles.
+3. **Reversal stability:** ~~kill if fallback > 20% of cycles~~ → done (see above): stable to ~4
+   rejected tokens, diverges by 8; limited to a capped hybrid with replay.
 4. **System:** end-to-end on `evals/` (paired vs llama.cpp, lossless gate) at 1k and 8k context.
