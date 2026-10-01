@@ -168,6 +168,8 @@ PROMPTS = {
 
 
 def main() -> None:
+    """Interleaved end-to-end bench: every config runs once per round, best of ROUNDS kept,
+    so background CPU/GPU load hits all configs alike. Exactness checked against greedy."""
     from mlx_lm import load
 
     model, tok = load("mlx-community/Qwen3.5-4B-MLX-4bit")
@@ -178,27 +180,28 @@ def main() -> None:
     from skinny_mlx.mtp import load_mtp_head
 
     head = load_mtp_head(model)
-    N = 200
+    N, ROUNDS = 200, 5
+    configs = [("greedy", None, 0)] + [("mtp32k", MTPDrafter(model, head), k) for k in (1, 2, 3, 4, 5, 6)]
     for name, text in PROMPTS.items():
         prompt = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True,
                                          enable_thinking=False)
         greedy(model, prompt, 8)  # warm-up
-        t = time.perf_counter(); ref = greedy(model, prompt, N); tg = time.perf_counter() - t
-        print(f"[{name}] greedy {N / tg:6.1f} tok/s")
-        runs = [("lookup", PromptLookupDrafter(), 3)]
-        runs += [("mtp", MTPDrafter(model, head, vocab=None), k) for k in (2, 3)]
-        runs += [("mtp32k", MTPDrafter(model, head), k) for k in (2, 3, 4, 5, 6)]
-        for dname, drafter, k in runs:
-            st = {}
-            t = time.perf_counter(); got = speculative(model, prompt, N, drafter, k, st); ts = time.perf_counter() - t
-            same = next((i for i, (a, b) in enumerate(zip(ref, got)) if a != b), N)
-            margin = ""
-            if same < N:  # near-tie? top-2 gap of a fresh full-prefix forward at the divergence point
-                lg = model(mx.array([prompt + ref[:same]]))[0, -1].astype(mx.float32)
-                top = mx.sort(lg)[-2:].tolist()
-                margin = f" (top1-top2 gap there {top[1] - top[0]:.3f})"
-            print(f"  {dname:6s} K={k}: {N / ts:6.1f} tok/s ({tg / ts:4.2f}x) | "
-                  f"{st['tokens_per_step']:.2f} tok/step | identical first {same}/{N}{margin}")
+        ref = greedy(model, prompt, N)
+        best, stats = {}, {}
+        for _ in range(ROUNDS):
+            for cname, drafter, k in configs:
+                st = {}
+                t = time.perf_counter()
+                got = greedy(model, prompt, N) if drafter is None else speculative(model, prompt, N, drafter, k, st)
+                dt = time.perf_counter() - t
+                key = f"{cname} K={k}" if drafter else cname
+                best[key] = min(best.get(key, 1e9), dt)
+                stats[key] = (st.get("tokens_per_step", 1.0), next((i for i, (a, b) in enumerate(zip(ref, got)) if a != b), N))
+        base = best["greedy"]
+        print(f"[{name}] best of {ROUNDS}, {N} tokens")
+        for key, dt in best.items():
+            tps, same = stats[key]
+            print(f"  {key:12s} {N / dt:6.1f} tok/s ({base / dt:4.2f}x) | {tps:.2f} tok/step | identical first {same}/{N}")
 
 
 if __name__ == "__main__":
