@@ -21,10 +21,11 @@ from mlx_lm.models.cache import KVCache, make_prompt_cache
 from skinny_mlx.rollback import HybridRollback
 
 
-def forward(model: nn.Module, ids: list[int], cache) -> tuple[mx.array, mx.array]:
-    """(final normed hidden [1,T,H], logits [1,T,V]) for a tied-embedding mlx_lm Qwen3.5 model."""
+def forward(model: nn.Module, ids, cache) -> tuple[mx.array, mx.array]:
+    """(final normed hidden [1,T,H], logits [1,T,V]) for a tied-embedding mlx_lm Qwen3.5 model.
+    ids may be a list or a lazy mx.array (lets draft tokens flow into verify without a host sync)."""
     inner = model.language_model.model
-    h = inner(mx.array([ids]), cache)
+    h = inner(ids[None] if isinstance(ids, mx.array) else mx.array([ids]), cache)
     return h, inner.embed_tokens.as_linear(h)
 
 
@@ -37,14 +38,14 @@ class PromptLookupDrafter:
     def begin(self, prompt, h, first):
         self.ctx = list(prompt) + [first]
 
-    def draft(self, k: int) -> list[int]:
+    def draft(self, k: int) -> mx.array:
         ctx = self.ctx
         for n in range(self.ngram, 0, -1):
             tail = ctx[-n:]
             for start in range(len(ctx) - n - 1, -1, -1):
                 if ctx[start : start + n] == tail:
-                    return ctx[start + n : start + n + k]
-        return []
+                    return mx.array(ctx[start + n : start + n + k], dtype=mx.int32)
+        return mx.array([], dtype=mx.int32)
 
     def update(self, h_kept, new_tokens):
         self.ctx += new_tokens
@@ -53,9 +54,22 @@ class PromptLookupDrafter:
 class MTPDrafter:
     """Chains the model's native MTP head K times; keeps its own KV cache in sync with accepted tokens."""
 
-    def __init__(self, model: nn.Module, head: nn.Module):
+    def __init__(self, model: nn.Module, head: nn.Module, vocab: int | None = 32768):
+        """vocab: score drafts over token ids [0, vocab) only. BPE ids are roughly frequency-ordered,
+        so a prefix keeps most mass at a fraction of the tied head's 248k-row read; verify still
+        uses the full head, so output is unchanged — only acceptance can drop."""
         self.embed = model.language_model.model.embed_tokens
         self.head = head
+        e = self.embed
+        self._head_w = (e.weight[:vocab], e.scales[:vocab], e.biases[:vocab]) if vocab else None
+        if self._head_w:
+            mx.eval(self._head_w)
+
+    def _logits(self, h: mx.array) -> mx.array:
+        if self._head_w is None:
+            return self.embed.as_linear(h)
+        w, s, b = self._head_w
+        return mx.quantized_matmul(h, w, s, b, transpose=True, group_size=self.embed.group_size, bits=self.embed.bits)
 
     def _step(self, tokens: mx.array, hidden: mx.array) -> mx.array:
         return self.head(self.embed(tokens), hidden, self.cache)
@@ -65,15 +79,15 @@ class MTPDrafter:
         self.h_last = self._step(mx.array([list(prompt[1:]) + [first]]), h)[:, -1:]
         self.n_spec = 0
 
-    def draft(self, k: int) -> list[int]:
+    def draft(self, k: int) -> mx.array:
         toks, h = [], self.h_last
-        for i in range(k):  # built lazily: one host sync for the whole chain
-            t = mx.argmax(self.embed.as_linear(h)[:, -1], axis=-1)
+        for i in range(k):  # lazy: the chain feeds verify directly, no host sync in between
+            t = mx.argmax(self._logits(h)[:, -1], axis=-1).astype(mx.int32)
             toks.append(t)
             if i < k - 1:
                 h = self._step(t[None], h)
         self.n_spec = k - 1
-        return mx.concatenate(toks).tolist()
+        return mx.concatenate(toks)
 
     def update(self, h_kept, new_tokens):
         self.cache.trim(self.n_spec)  # drop the speculative chain entries
@@ -94,7 +108,18 @@ def greedy(model: nn.Module, prompt: list[int], max_tokens: int) -> list[int]:
 
 
 def speculative(model: nn.Module, prompt: list[int], max_tokens: int, drafter, k: int,
-                stats: dict | None = None) -> list[int]:
+                stats: dict | None = None, profile: bool = False) -> list[int]:
+    """profile=True syncs at phase boundaries and adds per-phase ms/step to stats (slower overall)."""
+    phase = {"draft": 0.0, "verify": 0.0, "rollback": 0.0, "drafter update": 0.0}
+    clock = [time.perf_counter()]
+
+    def mark(name, *arrays):
+        if profile:
+            mx.eval(*arrays)
+            now = time.perf_counter()
+            phase[name] += now - clock[0]
+            clock[0] = now
+
     cache = make_prompt_cache(model)
     rb = HybridRollback.for_model(model)
     h, logits = forward(model, prompt, cache)
@@ -102,21 +127,32 @@ def speculative(model: nn.Module, prompt: list[int], max_tokens: int, drafter, k
     drafter.begin(prompt, h, out[0])
     steps = 0
     while len(out) < max_tokens:
-        draft = drafter.draft(k)
-        x = [out[-1]] + draft
+        if profile:
+            clock[0] = time.perf_counter()
+        draft_arr = drafter.draft(k)
+        mark("draft", draft_arr)
+        x_arr = mx.concatenate([mx.array([out[-1]], dtype=mx.int32), draft_arr])
         rb.record()
-        h, logits = forward(model, x, cache)
-        pred = mx.argmax(logits[0], axis=-1).tolist()
+        h, logits = forward(model, x_arr, cache)
+        pred_arr = mx.argmax(logits[0], axis=-1)
+        mx.eval(pred_arr, draft_arr)  # the step's one host sync
+        pred, draft = pred_arr.tolist(), draft_arr.tolist()
+        x = [out[-1]] + draft
+        mark("verify")
         n = 0
         while n < len(draft) and draft[n] == pred[n]:
             n += 1
         rb.rollback(cache, fed=len(x), keep=n + 1)
+        mark("rollback", *[c for layer_cache in cache for c in getattr(layer_cache, "cache", [])])
         new = draft[:n] + [pred[n]]
         drafter.update(h[:, : n + 1], x[1 : n + 1] + [pred[n]])
+        mark("drafter update", *([drafter.h_last] if hasattr(drafter, "h_last") else []))
         out += new
         steps += 1
     if stats is not None:
         stats.update(steps=steps, tokens_per_step=len(out) / max(steps, 1))
+        if profile:
+            stats["ms_per_step"] = {k: round(v / max(steps, 1) * 1e3, 2) for k, v in phase.items()}
     return out[:max_tokens]
 
 
@@ -149,7 +185,9 @@ def main() -> None:
         greedy(model, prompt, 8)  # warm-up
         t = time.perf_counter(); ref = greedy(model, prompt, N); tg = time.perf_counter() - t
         print(f"[{name}] greedy {N / tg:6.1f} tok/s")
-        runs = [("lookup", PromptLookupDrafter(), 3)] + [("mtp", MTPDrafter(model, head), k) for k in (1, 2, 3, 4, 6)]
+        runs = [("lookup", PromptLookupDrafter(), 3)]
+        runs += [("mtp", MTPDrafter(model, head, vocab=None), k) for k in (2, 3)]
+        runs += [("mtp32k", MTPDrafter(model, head), k) for k in (2, 3, 4, 5, 6)]
         for dname, drafter, k in runs:
             st = {}
             t = time.perf_counter(); got = speculative(model, prompt, N, drafter, k, st); ts = time.perf_counter() - t
