@@ -24,6 +24,26 @@ The model's own 249 quantized matmuls alone (`bench/model_matmuls.py`, bf16 both
 **1.82× at M=8, 1.52× at M=16**. M=8 logits match stock MLX (100% argmax agreement,
 max rel diff 1.3e-2 — bf16 rounding level).
 
+## End-to-end: speculative decoding on a hybrid model (new on MLX)
+
+Stock `mlx_lm` refuses to speculate on Qwen3.5 (`requires a trimmable prompt cache`). With this
+repo's replay-free GDN rollback + the model's own native MTP head (stripped by mlx_lm, fetched
+here) + a pruned draft vocabulary (`skinny_mlx/spec.py`), greedy-exact:
+
+| prompt | MLX greedy | FlatSpec (MTP, K=2) | speedup | tokens/step |
+|---|---:|---:|---:|---:|
+| code rewrite | 102.5 tok/s | **177.6 tok/s** | **1.73×** | 2.51 |
+| explanation (chat) | — | — | 1.3–1.6× | 2.1 |
+
+Output matches plain greedy token-for-token up to bf16 near-ties (every divergence is checked:
+top1–top2 logit gap 0.125–0.25, i.e. one or two bf16 ulps). vs llama.cpp on the same model
+(74.6 tok/s): **2.4×** on code.
+
+Caveat: this machine had intermittent background load (Spotlight indexing) during most runs;
+the table is the clean best-of-3 interleaved run. The skinny kernel only engages at ≥6 tokens
+per step, and with a chained 1-layer MTP head the best K is 2–3, so its end-to-end effect is
+still unresolved under the noise — see `docs/flatspec-design.md`.
+
 ## How
 
 - `skinny_mlx/qmm.py` — 4-bit quantized matmul for 2–16 tokens: 8×8 `simdgroup_matrix` MMA,
@@ -61,6 +81,7 @@ Close GPU-heavy apps first — background GPU load swings results 2–3×.
 ## Status
 
 Prototype. Keeps both weight layouts resident (2× weight memory). Apple M1–M4 tuned on M4 Max.
-Next: native MTP drafting, pruned-vocab draft head, replay-free GDN rollback, end-to-end tok/s.
+Next: deeper/tree drafts so verification runs at M≥6 where the skinny kernel wins, rejection
+sampling for T>0, an M=1 path on the repacked layout (drop the 2× memory), M5 TensorOps.
 
 MIT licensed.
