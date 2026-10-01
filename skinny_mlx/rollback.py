@@ -17,6 +17,13 @@ _orig_gdu = qwen3_5.gated_delta_update
 
 
 class HybridRollback:
+    @classmethod
+    def for_model(cls, model: nn.Module) -> "HybridRollback":
+        """One instance per model: hooks are installed once, not stacked per generation."""
+        if getattr(model, "_skinny_rollback", None) is None:
+            model._skinny_rollback = cls(model)
+        return model._skinny_rollback
+
     def __init__(self, model: nn.Module):
         self.layers = model.layers
         self.gdn_idx = [i for i, l in enumerate(self.layers) if getattr(l, "is_linear", False)]
