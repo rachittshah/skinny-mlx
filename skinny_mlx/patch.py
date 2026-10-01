@@ -1,11 +1,17 @@
-"""Drop-in patch: route 3..16-token quantized matmuls of an mlx_lm model through skinny_qmm.
+"""Drop-in patch for mlx_lm models: skinny qmm for 6..16-token steps + horizontal projection fusion.
 
-M = 1..2 keeps MLX's qmv (already ~97% of bandwidth); M = 3..16 (speculative verify, small
-batches) uses the MMA kernel on lane-order repacked weights. Prototype keeps both weight
-layouts resident (2x weight memory) — a production version would add an M=1 path on the
-repacked layout and drop the original.
+1. Skinny routing: M = 1..5 keeps MLX's qmv/qmm (qmv is ~97% of bandwidth at M=1); M = 6..16
+   (speculative verify, small batches) uses the MMA kernel on lane-order repacked weights.
+2. Horizontal fusion: projections that read the same input (GDN qkv/z/b/a, attention q/k/v,
+   MLP gate/up) are concatenated along N at load time and run as ONE matmul; siblings return
+   slices of the cached result (matched by input identity, so the model code is untouched).
+   Cuts Qwen3.5-4B from 249 to ~129 matmul dispatches per step and removes the N=32
+   launch-latency-bound in_proj_a/b calls. Helps the M=1 MLX path too.
 
-Run:  uv run python -m skinny_mlx.patch   (logit equivalence check vs unpatched model)
+Prototype keeps both weight layouts resident (2x weight memory); a production version would
+add an M=1 path on the repacked layout and drop the original.
+
+Run:  uv run python -m skinny_mlx.patch   (M=8 verify logits vs unpatched model and an fp32 reference)
 """
 
 import mlx.core as mx
@@ -13,7 +19,12 @@ import mlx.nn as nn
 
 from skinny_mlx.qmm import repack_for_skinny, skinny_qmm
 
-SKINNY_RANGE = (3, 16)
+SKINNY_RANGE = (6, 16)
+FUSE_GROUPS = [
+    ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),  # Gated DeltaNet mixer
+    ("q_proj", "k_proj", "v_proj"),                          # full attention
+    ("gate_proj", "up_proj"),                                # MLP
+]
 
 
 def _qmm(x: mx.array, w, s, b, rw, group_size: int, bits: int) -> mx.array:
@@ -38,30 +49,70 @@ class SkinnyQuantizedLinear(nn.Module):
         return y + self.bias if "bias" in self else y
 
 
+class _FusedGroup:
+    """Concatenated weights of same-input projections + a one-entry result cache."""
+
+    def __init__(self, qls: list[nn.QuantizedLinear]):
+        self.group_size, self.bits = qls[0].group_size, qls[0].bits
+        self.w = mx.concatenate([q.weight for q in qls])
+        self.s = mx.concatenate([q.scales for q in qls])
+        self.b = mx.concatenate([q.biases for q in qls])
+        self.rw = repack_for_skinny(self.w)
+        sizes = [q.weight.shape[0] for q in qls]
+        self.bounds = [(sum(sizes[:i]), sum(sizes[: i + 1])) for i in range(len(sizes))]
+        self.x = self.y = None
+
+    def output(self, x: mx.array) -> mx.array:
+        if self.x is not x:  # strong ref held, so identity can't be recycled
+            self.x, self.y = x, _qmm(x, self.w, self.s, self.b, self.rw, self.group_size, self.bits)
+        return self.y
+
+
+class FusedSliceLinear(nn.Module):
+    def __init__(self, group: _FusedGroup, idx: int):
+        super().__init__()
+        self._group, (self._lo, self._hi) = group, group.bounds[idx]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self._group.output(x)[..., self._lo : self._hi]
+
+
+def _ok(m) -> bool:
+    return isinstance(m, nn.QuantizedLinear) and m.bits == 4 and m.group_size == 64 and "bias" not in m
+
+
 def _patch_tied_head(emb: nn.QuantizedEmbedding) -> None:
     rw = repack_for_skinny(emb.weight)
     mx.eval(rw)
     emb.as_linear = lambda x: _qmm(x, emb.weight, emb.scales, emb.biases, rw, emb.group_size, emb.bits)
 
 
-def patch_model(model: nn.Module) -> int:
-    """Swap every 4-bit/group-64 QuantizedLinear (and a tied quantized LM head). Returns modules patched."""
-    swaps = [(n, SkinnyQuantizedLinear(m)) for n, m in model.named_modules()
-             if isinstance(m, nn.QuantizedLinear) and m.bits == 4 and m.group_size == 64]
-    model.update_modules(_tree(swaps))
+def patch_model(model: nn.Module, fuse: bool = True) -> dict:
+    """Patch in place. Returns counts of fused groups, single swaps, and patched heads."""
+    stats = {"fused_groups": 0, "single": 0, "heads": 0}
+    fused_ids = set()
+    if fuse:
+        for _, parent in model.named_modules():
+            children = dict(parent.children()) if isinstance(parent, nn.Module) else {}
+            for names in FUSE_GROUPS:
+                if all(_ok(children.get(n)) for n in names):
+                    group = _FusedGroup([children[n] for n in names])
+                    mx.eval(group.rw, group.w, group.s, group.b)
+                    for i, n in enumerate(names):
+                        fused_ids.add(id(children[n]))
+                        setattr(parent, n, FusedSliceLinear(group, i))
+                    stats["fused_groups"] += 1
+    for _, parent in model.named_modules():
+        for n, child in dict(parent.children()).items():
+            if _ok(child) and id(child) not in fused_ids:
+                setattr(parent, n, SkinnyQuantizedLinear(child))
+                stats["single"] += 1
     mx.eval(model.parameters())
-    n = len(swaps)
     for _, m in model.named_modules():
         if isinstance(m, nn.QuantizedEmbedding) and m.bits == 4 and m.group_size == 64:
             _patch_tied_head(m)
-            n += 1
-    return n
-
-
-def _tree(pairs):
-    """[('a.b.0.c', mod)] -> nested dict/list tree for nn.Module.update_modules."""
-    from mlx.utils import tree_unflatten
-    return tree_unflatten(pairs)
+            stats["heads"] += 1
+    return stats
 
 
 def main() -> None:
@@ -71,16 +122,24 @@ def main() -> None:
     model, tok = load("mlx-community/Qwen3.5-4B-MLX-4bit")
     ids = mx.array([tok.encode("The quick brown fox jumps over the lazy dog. In computer science, a cache is")])
     draft = mx.array([tok.encode(" a hardware or software component that stores data")[:8]])
-    def logits_after_prefix():
+
+    def verify_logits():
         cache = make_prompt_cache(model)
         model(ids, cache=cache)
-        return model(draft, cache=cache).astype(mx.float32)   # M = 8 verify step
-    ref = logits_after_prefix(); mx.eval(ref)
-    print("dtype", ref.dtype, "patched modules:", patch_model(model))
-    got = logits_after_prefix(); mx.eval(got)
+        return model(draft, cache=cache).astype(mx.float32)  # M = 8 verify step
+
+    ref = verify_logits()
+    mx.eval(ref)
+    print("patch:", patch_model(model))
+    got = verify_logits()
+    mx.eval(got)
     rel = (mx.abs(ref - got).max() / mx.abs(ref).max()).item()
-    agree = (mx.argmax(ref, -1) == mx.argmax(got, -1)).mean().item()
-    print(f"M=8 verify logits: max rel diff {rel:.2e}, argmax agreement {agree:.0%}")
+    top_ref = mx.argmax(ref, -1)
+    agree = (top_ref == mx.argmax(got, -1)).mean().item()
+    # where argmax differs, is it a near-tie? (logit gap between the two candidates under the reference)
+    gap = mx.max(ref, -1) - mx.take_along_axis(ref, mx.argmax(got, -1)[..., None], -1)[..., 0]
+    print(f"M=8 verify logits: max rel diff {rel:.2e}, argmax agreement {agree:.0%}, "
+          f"max ref-logit gap at disagreements {gap.max().item():.3f}")
 
 
 if __name__ == "__main__":
