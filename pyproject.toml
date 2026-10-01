@@ -5,7 +5,7 @@ description = "Flat-cost 2-16 token quantized matmul for MLX on Apple Silicon: m
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-dependencies = ["mlx>=0.32", "mlx-lm>=0.31", "numpy"]
+dependencies = ["mlx>=0.32", "mlx-lm>=0.31", "numpy", "requests", "huggingface_hub"]
 
 [build-system]
 requires = ["hatchling"]
